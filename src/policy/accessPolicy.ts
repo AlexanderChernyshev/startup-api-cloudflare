@@ -2,6 +2,7 @@ import { AccessPolicySchema } from '../schemas/policy';
 import type { AccessPolicyConfig, AccessPolicyResolved, AccessRule, Gate, Requirement, UnauthorizedAction } from '../schemas/policy';
 import type { Entitlements } from '../entitlements/types';
 import { providerEntitlementCheckers, providerSupportsEntitlements } from './entitlementCheckers';
+import { Feature } from '../features/Feature';
 
 /**
  * Match a single path pattern against a request path.
@@ -29,17 +30,21 @@ function deny(reason: 'unauthenticated' | 'not_entitled', rule: AccessRule): Pol
 /**
  * Decide whether a request satisfies a resolved rule, given the auth state and resolved entitlements.
  * `bypass`/`public` always allow; `authenticated` needs a logged-in user; `entitlement` dispatches the
- * condition through the provider checker registry.
+ * condition through the provider checker registry; `feature` needs the feature in `ctx.features` (the
+ * features resolved for the visitor — for anonymous visitors, only the rolled-out ones).
  *
- * Admin users (`ctx.isAdmin`) bypass every requirement: identity has already been resolved and headers
- * forwarded by the time we get here, but the gate itself is skipped so admins can reach any gated path.
+ * Admin users (`ctx.isAdmin`) bypass the `authenticated` and `entitlement` requirements: identity has
+ * already been resolved and headers forwarded by the time we get here, but the gate itself is skipped
+ * so admins can reach those paths. `feature` requirements apply to admins too: a feature decides which
+ * version of the app someone gets, and admins get features like everyone else (an admin can enable one
+ * for themselves in the admin dashboard), so the gate stays consistent with `X-StartupAPI-Features`.
  */
 export function evaluateAccess(
   rule: AccessRule,
-  ctx: { authenticated: boolean; entitlements: Entitlements | null; isAdmin?: boolean },
+  ctx: { authenticated: boolean; entitlements: Entitlements | null; isAdmin?: boolean; features?: ReadonlySet<string> },
 ): PolicyDecision {
-  if (ctx.isAdmin) return { allow: true };
   const req = rule.requirement;
+  if (ctx.isAdmin && req.mode !== 'feature') return { allow: true };
   switch (req.mode) {
     case 'bypass':
     case 'public':
@@ -51,6 +56,10 @@ export function evaluateAccess(
       const checker = providerEntitlementCheckers[req.provider];
       const ok = checker ? checker(req.condition, ctx.entitlements) : false;
       return ok ? { allow: true } : deny('not_entitled', rule);
+    }
+    case 'feature': {
+      if (ctx.features?.has(req.feature)) return { allow: true };
+      return deny(ctx.authenticated ? 'not_entitled' : 'unauthenticated', rule);
     }
   }
 }
@@ -72,6 +81,9 @@ export class AccessPolicy {
         throw new Error(
           `Access policy references an entitlement condition for provider '${req.provider}', which does not support entitlement conditions`,
         );
+      }
+      if (req.mode === 'feature' && !Feature.get(req.feature)) {
+        throw new Error(`Access policy references unknown feature '${req.feature}'`);
       }
     }
 
