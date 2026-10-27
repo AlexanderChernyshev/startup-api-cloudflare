@@ -59,7 +59,7 @@ Either way, set your production secrets (`SESSION_SECRET`, OAuth credentials) on
 
 | Variable                 | Required | Default   | Description                                                                   |
 | :----------------------- | :------- | :-------- | :---------------------------------------------------------------------------- |
-| `ORIGIN_URL`             | **Yes**  | N/A       | The base URL of your origin application (e.g., `https://your-app-origin.com`) |
+| `ORIGIN_URL`             | **Yes**¹ | N/A       | The base URL of your origin application (e.g., `https://your-app-origin.com`) |
 | `USERS_PATH`             | No       | `/users/` | The path used to serve internal assets like `power-strip.js`                  |
 | `AUTH_ORIGIN`            | No       | N/A       | Optional base URL for OAuth redirects (overrides request origin)              |
 | `GOOGLE_CLIENT_ID`       | No       | N/A       | Google OAuth2 Client ID                                                       |
@@ -70,6 +70,8 @@ Either way, set your production secrets (`SESSION_SECRET`, OAuth credentials) on
 | `PATREON_CLIENT_SECRET`  | No       | N/A       | Patreon OAuth2 Client Secret                                                  |
 | `PATREON_WEBHOOK_SECRET` | No       | N/A       | Secret for verifying Patreon webhook signatures                               |
 | `ATPROTO_ENABLED`        | No       | N/A       | Set truthy (`true`/`1`/`yes`/`on`) to enable AT Protocol (Atmosphere) login   |
+
+¹ Not required when the origin is reached through an `ORIGIN` [service binding](#reaching-the-origin-through-a-service-binding).
 
 > AT Protocol (Atmosphere) login needs **no client secret** — it is a public OAuth client. Enable it either by setting `ATPROTO_ENABLED` truthy (a per-deployment switch) **or** through the `createStartupAPI` factory (see [AT Protocol / Atmosphere](#at-protocol--atmosphere-atproto) below). A factory `atproto: { enabled: false }` overrides the env flag, so a deployment can force it off.
 
@@ -200,11 +202,27 @@ The consent screen then additionally asks for email access, and the email is sto
 }
 ```
 
+### Reaching the origin through a service binding
+
+When your origin is another Cloudflare Worker in the same account, bind it as `ORIGIN` instead of (or as well as) setting `ORIGIN_URL`:
+
+```json
+{
+  "services": [{ "binding": "ORIGIN", "service": "your-origin-worker" }]
+}
+```
+
+Requests to the origin then go straight to that Worker through the [service binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/), never over the public internet. That lets the origin Worker have **no public URL at all** (`"workers_dev": false` and no routes), so the only way to reach it is through Startup API and it can trust the `X-StartupAPI-*` headers it receives.
+
+- With only `ORIGIN` set, the origin receives each request at its public URL and `Host` (for example `https://app.example.com/page`).
+- With both set, requests go through the binding but are addressed to `ORIGIN_URL`, as before.
+- Origin-sourced gate pages (`{ origin: '/path' }`) go through the binding too.
+
 ## How It Works
 
 1. **Request Interception:** The worker receives all incoming requests
 2. **Path Mapping:** If the request path starts with `USERS_PATH`, the worker serves assets directly from the `public/users/` directory
-3. **Proxying:** All other requests are proxied to the configured `ORIGIN_URL`
+3. **Proxying:** All other requests are proxied to the origin: the `ORIGIN` service binding when one is configured, otherwise `ORIGIN_URL`
 4. **Injection:** For `text/html` responses, the worker injects a `<script>` tag and a `<power-strip>` custom element before serving the content to the user
 
 ### Customizing the power strip
@@ -342,7 +360,7 @@ const accessPolicy = {
 
 For non-`bypass` paths the worker forwards `X-StartupAPI-Authenticated`, `X-StartupAPI-Login-Provider`, a compact `X-StartupAPI-Entitlements` JSON, and (for Patreon) `X-StartupAPI-Patreon-Active` / `-Tiers` / `-Benefits` alongside the existing `X-StartupAPI-User-Id` / `-Account-Id`. When [feature flags](#feature-flags) are configured, `X-StartupAPI-Features` lists the ids of the features enabled for the visitor (comma-separated).
 
-The origin can rely on these headers because the worker **removes every `X-StartupAPI-*` header the visitor sent** before forwarding a request, on every path (including `bypass` paths and origin-sourced gate pages). A header reaches the origin only if the worker set it, so a logged-out visitor can't pass a made-up `X-StartupAPI-User-Id`. This only protects requests that come through the worker: make sure the origin can't be reached directly, or it can be sent any header.
+The origin can rely on these headers because the worker **removes every `X-StartupAPI-*` header the visitor sent** before forwarding a request, on every path (including `bypass` paths and origin-sourced gate pages). A header reaches the origin only if the worker set it, so a logged-out visitor can't pass a made-up `X-StartupAPI-User-Id`. This only protects requests that come through the worker: make sure the origin can't be reached directly, or it can be sent any header. An `ORIGIN` [service binding](#reaching-the-origin-through-a-service-binding) lets the origin have no public URL at all.
 
 ### Keeping entitlements fresh
 
