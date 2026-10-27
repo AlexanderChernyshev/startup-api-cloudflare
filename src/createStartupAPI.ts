@@ -54,6 +54,18 @@ function defaultEntitlementTtlMs(providerName?: string): number {
 // spies on globalThis.fetch are honored).
 const originFetch = (...args: Parameters<typeof fetch>): Promise<Response> => globalThis.fetch(...args);
 
+/**
+ * Remove every `X-StartupAPI-*` header the visitor sent. The origin trusts these headers for identity,
+ * so it must only ever see the ones this worker sets; a client-supplied `X-StartupAPI-User-Id` would
+ * otherwise reach it unchanged whenever the worker doesn't overwrite it (logged out, no current account,
+ * bypass paths).
+ */
+function stripStartupAPIHeaders(headers: Headers): void {
+  for (const name of [...headers.keys()]) {
+    if (name.startsWith('x-startupapi-')) headers.delete(name);
+  }
+}
+
 function isCronEnabled(options: ProviderOptions): boolean {
   const cron = options.entitlementCron;
   return cron === true || (typeof cron === 'object' && cron !== null);
@@ -121,6 +133,7 @@ async function serveGatePage(source: PageSource, status: number, request: Reques
     const target = new URL(source.origin, new URL(env.ORIGIN_URL));
     const proxied = new Request(target.toString(), request);
     proxied.headers.set('Host', target.host);
+    stripStartupAPIHeaders(proxied.headers);
     res = await originFetch(proxied);
   }
   // Re-stamp the status (e.g. a 200 asset can be served as the configured gate status).
@@ -338,14 +351,14 @@ export function createStartupAPI(config: StartupAPIConfig = {}) {
 
       const newRequest = new Request(url.toString(), request);
       newRequest.headers.set('Host', url.host);
+      // Never forward client-supplied identity, entitlement or feature headers, on any path; the ones
+      // the origin should see are set below from the resolved session.
+      stripStartupAPIHeaders(newRequest.headers);
 
       if (rule.requirement.mode === 'bypass') {
         // Pure pass-through: no identity resolution, no headers, no power-strip injection.
         return originFetch(newRequest);
       }
-
-      // Never forward a client-supplied feature list; it is set below from the resolved features.
-      newRequest.headers.delete('X-StartupAPI-Features');
 
       const user = await getUserFromSession(request, env, cookieManager, sessionTtlMs);
       const authenticated = !!user;

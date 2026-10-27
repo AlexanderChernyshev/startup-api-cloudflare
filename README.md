@@ -284,7 +284,7 @@ StartupAPI can gate access to paths and forward the visitor's login/entitlement 
 
 Configure an ordered list of rules (first match wins) mapping a path pattern to a requirement, plus a `default` for unmatched paths. Requirement modes:
 
-- **`bypass`** — raw pass-through: no credential check, no identity resolution, no headers, no power-strip injection.
+- **`bypass`** — raw pass-through: no credential check, no identity resolution, no headers, no power-strip injection. Client-supplied `X-StartupAPI-*` headers are still removed (see [Headers forwarded to the origin](#headers-forwarded-to-the-origin)).
 - **`public`** — anyone; the session is resolved and identity/entitlement headers are forwarded when present.
 - **`authenticated`** — any logged-in user.
 - **`entitlement`** — a provider condition: Patreon `active_patron`, a specific `benefit` (perk) ID, or a `tier` ID.
@@ -341,6 +341,8 @@ const accessPolicy = {
 ### Headers forwarded to the origin
 
 For non-`bypass` paths the worker forwards `X-StartupAPI-Authenticated`, `X-StartupAPI-Login-Provider`, a compact `X-StartupAPI-Entitlements` JSON, and (for Patreon) `X-StartupAPI-Patreon-Active` / `-Tiers` / `-Benefits` alongside the existing `X-StartupAPI-User-Id` / `-Account-Id`. When [feature flags](#feature-flags) are configured, `X-StartupAPI-Features` lists the ids of the features enabled for the visitor (comma-separated).
+
+The origin can rely on these headers because the worker **removes every `X-StartupAPI-*` header the visitor sent** before forwarding a request, on every path (including `bypass` paths and origin-sourced gate pages). A header reaches the origin only if the worker set it, so a logged-out visitor can't pass a made-up `X-StartupAPI-User-Id`. This only protects requests that come through the worker: make sure the origin can't be reached directly, or it can be sent any header.
 
 ### Keeping entitlements fresh
 
