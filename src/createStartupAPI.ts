@@ -23,7 +23,7 @@ import { handleSSR } from './handlers/ssr';
 
 import type { StartupAPIEnv } from './StartupAPIEnv';
 import { StartupAPIConfigSchema, DEFAULT_SESSION_TTL_MS, durationToMs } from './schemas/config';
-import type { StartupAPIConfig, ProviderOptions, ResolvedFreshness } from './schemas/config';
+import type { StartupAPIConfig, ProviderOptions, ResolvedFreshness, OriginResolver } from './schemas/config';
 import type { AccessPolicyConfig, PageSource } from './schemas/policy';
 import { AccessPolicy, evaluateAccess } from './policy/accessPolicy';
 import type { PolicyDecision } from './policy/accessPolicy';
@@ -55,8 +55,8 @@ function defaultEntitlementTtlMs(providerName?: string): number {
 const originFetch = (env: StartupAPIEnv, request: Request): Promise<Response> =>
   env.ORIGIN ? env.ORIGIN.fetch(request) : globalThis.fetch(request);
 
-/** True when an origin is configured: a service binding, an ORIGIN_URL, or both. */
-const hasOrigin = (env: StartupAPIEnv): boolean => !!env.ORIGIN || !!env.ORIGIN_URL;
+/** True when an origin is configured: an `origin` resolver, a service binding, an ORIGIN_URL, or a mix. */
+const hasOrigin = (env: StartupAPIEnv, resolver?: OriginResolver): boolean => !!resolver || !!env.ORIGIN || !!env.ORIGIN_URL;
 
 /**
  * Remove every `X-StartupAPI-*` header the visitor sent. The origin trusts these headers for identity,
@@ -122,10 +122,17 @@ function resolveAccessPolicy(configPolicy: AccessPolicyConfig | undefined): Acce
 
 /**
  * Serve a gate page body in place (no redirect), sourced from either the ASSETS binding (a local file)
- * or a path proxied from ORIGIN_URL. The configured status is re-stamped onto the response so e.g. a
+ * or a path proxied from the origin. The configured status is re-stamped onto the response so e.g. a
  * 200 asset can be served as a 403 gate.
  */
-async function serveGatePage(source: PageSource, status: number, request: Request, env: StartupAPIEnv, reqUrl: URL): Promise<Response> {
+async function serveGatePage(
+  source: PageSource,
+  status: number,
+  request: Request,
+  env: StartupAPIEnv,
+  reqUrl: URL,
+  originBase: URL | null,
+): Promise<Response> {
   let res: Response;
   if ('asset' in source) {
     // Serve a local file from ASSETS, mirroring the existing user-asset path.
@@ -134,8 +141,8 @@ async function serveGatePage(source: PageSource, status: number, request: Reques
     res = await env.ASSETS.fetch(assetReq);
   } else {
     // Proxy a path from the origin (swap host, set Host), like the main origin proxy. With only a
-    // service binding and no ORIGIN_URL, the request keeps its own host.
-    const target = new URL(source.origin, env.ORIGIN_URL ? new URL(env.ORIGIN_URL) : reqUrl);
+    // service binding and no origin URL, the request keeps its own host.
+    const target = new URL(source.origin, originBase ?? reqUrl);
     const proxied = new Request(target.toString(), request);
     proxied.headers.set('Host', target.host);
     stripStartupAPIHeaders(proxied.headers);
@@ -156,13 +163,14 @@ function denyResponse(
     request: Request;
     env: StartupAPIEnv;
     url: URL;
+    originBase: URL | null;
   },
 ): Response | Promise<Response> {
   if (decision.action === 'gate' && decision.gate) {
     // Serve an explainer page in place: anonymous variant for logged-out visitors, unentitled variant
     // (falling back to anonymous) for logged-in visitors who fail the requirement. No redirect.
     const source = ctx.authenticated ? (decision.gate.unentitled ?? decision.gate.anonymous) : decision.gate.anonymous;
-    return serveGatePage(source, decision.gate.status ?? 200, ctx.request, ctx.env, ctx.url);
+    return serveGatePage(source, decision.gate.status ?? 200, ctx.request, ctx.env, ctx.url, ctx.originBase);
   }
   if (decision.action === 'forbidden') {
     return new Response('Forbidden', { status: 403 });
@@ -194,6 +202,8 @@ export function createStartupAPI(config: StartupAPIConfig = {}) {
     .map(([name]) => name);
   const anyCron = cronProviders.length > 0;
   const patreonWebhookEnabled = providerConfigs.patreon?.entitlementWebhook === true;
+  // Taken from the raw config: a function passes through zod's custom check unchanged.
+  const originResolver = config.origin;
 
   const fetch = async (request: Request, env: StartupAPIEnv, ctx: ExecutionContext): Promise<Response> => {
     // Features first: plans and the access policy are validated against them.
@@ -214,7 +224,7 @@ export function createStartupAPI(config: StartupAPIConfig = {}) {
       return env.ASSETS.fetch(request);
     }
 
-    if (!hasOrigin(env) || !env.SESSION_SECRET) {
+    if (!hasOrigin(env, originResolver) || !env.SESSION_SECRET) {
       return env.ASSETS.fetch(request);
     }
 
@@ -343,19 +353,27 @@ export function createStartupAPI(config: StartupAPIConfig = {}) {
       return env.ASSETS.fetch(newRequest);
     }
 
-    if (hasOrigin(env)) {
+    if (hasOrigin(env, originResolver)) {
+      // Where this request goes: the `origin` resolver's answer, otherwise ORIGIN_URL. Null with no
+      // resolver means a service binding alone, which keeps the request's own URL.
+      let originBase: URL | null = env.ORIGIN_URL ? new URL(env.ORIGIN_URL) : null;
+      if (originResolver) {
+        const resolved = await originResolver({ request, url: new URL(url), env });
+        if (!resolved) return new Response('Not Found', { status: 404 });
+        originBase = new URL(resolved);
+      }
+
       // Evaluate the access policy BEFORE any identity work, so bypass paths are a raw proxy.
       const rule = AccessPolicy.evaluate(url.pathname);
       const requestOrigin = env.AUTH_ORIGIN && env.AUTH_ORIGIN !== '' ? env.AUTH_ORIGIN : url.origin;
       const returnUrl = url.pathname + url.search;
 
-      // Point the request at ORIGIN_URL when one is set. With only a service binding, the origin
+      // Point the request at the origin URL when there is one. With only a service binding, the origin
       // receives the request at its public URL (the binding decides where it goes, not the host).
-      if (env.ORIGIN_URL) {
-        const originUrl = new URL(env.ORIGIN_URL);
-        url.protocol = originUrl.protocol;
-        url.host = originUrl.host;
-        url.port = originUrl.port;
+      if (originBase) {
+        url.protocol = originBase.protocol;
+        url.host = originBase.host;
+        url.port = originBase.port;
       }
 
       const newRequest = new Request(url.toString(), request);
@@ -439,6 +457,7 @@ export function createStartupAPI(config: StartupAPIConfig = {}) {
           request,
           env,
           url,
+          originBase,
         });
       }
 

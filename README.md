@@ -71,7 +71,7 @@ Either way, set your production secrets (`SESSION_SECRET`, OAuth credentials) on
 | `PATREON_WEBHOOK_SECRET` | No       | N/A       | Secret for verifying Patreon webhook signatures                               |
 | `ATPROTO_ENABLED`        | No       | N/A       | Set truthy (`true`/`1`/`yes`/`on`) to enable AT Protocol (Atmosphere) login   |
 
-¹ Not required when the origin is reached through an `ORIGIN` [service binding](#reaching-the-origin-through-a-service-binding).
+¹ Not required when the origin is reached through an `ORIGIN` [service binding](#reaching-the-origin-through-a-service-binding), or chosen per request with the [`origin` option](#choosing-the-origin-per-request).
 
 > AT Protocol (Atmosphere) login needs **no client secret** — it is a public OAuth client. Enable it either by setting `ATPROTO_ENABLED` truthy (a per-deployment switch) **or** through the `createStartupAPI` factory (see [AT Protocol / Atmosphere](#at-protocol--atmosphere-atproto) below). A factory `atproto: { enabled: false }` overrides the env flag, so a deployment can force it off.
 
@@ -218,11 +218,30 @@ Requests to the origin then go straight to that Worker through the [service bind
 - With both set, requests go through the binding but are addressed to `ORIGIN_URL`, as before.
 - Origin-sourced gate pages (`{ origin: '/path' }`) go through the binding too.
 
+### Choosing the origin per request
+
+To put one deployment in front of several origins, pass an `origin` function to `createStartupAPI`. It gets each request and returns the base URL of the origin to send it to, for example by hostname:
+
+```ts
+const api = createStartupAPI({
+  // pr-42.previews.example.com → https://pr-42.origins.example.com
+  origin: ({ url }) => {
+    const m = url.hostname.match(/^pr-(\d+)\.previews\.example\.com$/);
+    return m ? `https://pr-${m[1]}.origins.example.com` : null;
+  },
+});
+```
+
+- The function receives `{ request, url, env }` and may be async. It runs on every request that would go to the origin, after Startup API's own paths (`USERS_PATH` pages, the API and login), which keep working whatever it returns.
+- Requests are addressed to the returned URL, with `Host` set to match, exactly as with `ORIGIN_URL`. It takes the place of `ORIGIN_URL`, so that variable isn't needed.
+- Returning `null` or `undefined` means this request has no origin: the visitor gets a 404 and nothing is forwarded. Only return URLs you trust; never build one from unchecked parts of the request.
+- With an `ORIGIN` service binding as well, requests still go through the binding, addressed to the returned URL. Origin-sourced gate pages use the returned origin too.
+
 ## How It Works
 
 1. **Request Interception:** The worker receives all incoming requests
 2. **Path Mapping:** If the request path starts with `USERS_PATH`, the worker serves assets directly from the `public/users/` directory
-3. **Proxying:** All other requests are proxied to the origin: the `ORIGIN` service binding when one is configured, otherwise `ORIGIN_URL`
+3. **Proxying:** All other requests are proxied to the origin: the `ORIGIN` service binding when one is configured, otherwise the URL from the `origin` option or `ORIGIN_URL`
 4. **Injection:** For `text/html` responses, the worker injects a `<script>` tag and a `<power-strip>` custom element before serving the content to the user
 
 ### Customizing the power strip
